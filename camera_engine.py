@@ -35,6 +35,7 @@ class CameraStream:
         self.recording = False
         self.buffer = deque(maxlen=BUFFER_SECONDS * FPS)
         self.writer = None
+        self.video_file_path = None
         self.frames_left = 0
         self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(
             history=500, varThreshold=120, detectShadows=False
@@ -96,6 +97,7 @@ class CameraStream:
         os.makedirs(path, exist_ok=True)
         ts = now.strftime("%H-%M-%S")
         filename = os.path.join(path, f"motion_{ts}.webm")
+        self.video_file_path = filename
         self.writer = cv2.VideoWriter(filename, cv2.VideoWriter_fourcc(*'VP80'), FPS, (WIDTH, HEIGHT))
         for f in self.buffer:
             self.writer.write(f)
@@ -105,5 +107,16 @@ class CameraStream:
         if self.writer:
             self.writer.release()
             self.writer = None
+            # Usunąć nagrania które trwają dokładnie 15 sekund (kamera się wyłączyła)
+            if self.video_file_path and os.path.exists(self.video_file_path):
+                try:
+                    cap = cv2.VideoCapture(self.video_file_path)
+                    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                    duration_seconds = frame_count / FPS if FPS > 0 else 0
+                    cap.release()
+                    if duration_seconds == 15:
+                        os.remove(self.video_file_path)
+                except Exception:
+                    pass
 
 cameras = [CameraStream(cfg) for cfg in CAM_CONFIG]
