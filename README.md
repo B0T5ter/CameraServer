@@ -60,10 +60,11 @@ pip install flask flask-login opencv-python
 python main.py
 ```
 
-4. Open your browser and go to:
+4. Open your browser through the configured HTTPS reverse proxy. The Flask process
+   listens locally on port `21320` and has secure session cookies enabled.
 
 ```
-http://0.0.0.0:21320
+https://your-monitoring-host/
 ```
 
 ## Important Notes
@@ -77,7 +78,7 @@ http://0.0.0.0:21320
 
 - `camera_engine.py` saves recordings in the folder structure `YYYY-MM-DD/<camera>/<hour>`.
 - `auth.py` sends a 2FA code to the user email addresses defined in `USER_EMAILS`.
-- `main.py` uses the `SECRET_KEY` from `.env` or generates a random one if missing.
+- `main.py` requires a non-placeholder `SECRET_KEY` from `.env`.
 
 ---
 

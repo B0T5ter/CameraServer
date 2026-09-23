@@ -1,9 +1,11 @@
 from flask import Response, render_template_string, request, redirect, url_for, session
 from flask_login import login_user, login_required, logout_user, current_user
+import hmac
+import secrets
 import shutil
 import cv2
 import time
-from auth import User, send_otp_mail, verification_codes
+from auth import User, send_otp_mail, otp_is_valid, is_login_blocked, is_otp_blocked, record_failed_login, clear_login_state
 from config import USERS, NGINX_URL
 
 HTML_BASE = """
@@ -22,7 +24,6 @@ HTML_BASE = """
         .container { padding: 20px; text-align: center; }
         .cam-grid { display: flex; flex-wrap: wrap; justify-content: center; gap: 15px; }
         .cam-box { background: #000; border: 1px solid #333; max-width: 640px; width: 100%; position: relative; }
-        .cam-label { position: absolute; top: 0; left: 0; background: rgba(0,0,0,0.6); padding: 5px 10px; font-weight: bold; width: 100%; text-align: left; box-sizing: border-box; }
         img.stream { width: 100%; height: auto; display: block; }
         iframe { width: 100%; height: 80vh; border: none; background: #fff; border-radius: 5px; }
         .login-box { width: 300px; margin: 100px auto; background: #1f1f1f; padding: 30px; border-radius: 8px; }
@@ -37,7 +38,10 @@ HTML_BASE = """
         <nav>
             <a href="/" class="nav-btn">Na Zywo</a>
             <a href="/recordings" class="nav-btn">Nagrania</a>
-            <a href="/logout" class="nav-btn btn-logout">Wyloguj</a>
+            <form method="post" action="/logout" style="display: inline;">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <button type="submit" class="nav-btn btn-logout">Wyloguj</button>
+            </form>
         </nav>
     </header>
     {% endif %}
@@ -54,6 +58,7 @@ HTML_LOGIN = """
 <div class="login-box">
     <h2>Zaloguj sie</h2>
     <form method="post" action="/login">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <input type="text" name="username" placeholder="Uzytkownik" required autofocus>
         <input type="password" name="password" placeholder="Haslo" required>
         <button type="submit">Wejdz</button>
@@ -71,6 +76,7 @@ HTML_VERIFY = """
 <div class="login-box">
     <h2>Wpisz kod z maila</h2>
     <form method="post" action="/verify">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <input type="text" name="code" placeholder="6-cyfrowy kod" required autofocus>
         <button type="submit">Weryfikuj</button>
     </form>
@@ -98,7 +104,6 @@ HTML_DASHBOARD = """
     <div class="cam-grid">
         {% for cam in cams %}
         <div class="cam-box">
-            <div class="cam-label">{{ cam.name }}</div>
             <img src="/video_feed/{{ cam.name }}" class="stream">
         </div>
         {% endfor %}
@@ -124,11 +129,30 @@ def setup_routes(app, cameras):
         'recordings': HTML_RECORDINGS
     })
 
+    @app.context_processor
+    def inject_csrf_token():
+        token = session.get('csrf_token')
+        if not token:
+            token = secrets.token_urlsafe(32)
+            session['csrf_token'] = token
+        return {'csrf_token': token}
+
+    def csrf_is_valid():
+        submitted_token = request.form.get('csrf_token', '')
+        session_token = session.get('csrf_token', '')
+        return bool(session_token) and hmac.compare_digest(session_token, submitted_token)
+
     @app.route('/login', methods=['GET', 'POST'])
     def login():
         if request.method == 'POST':
+            if not csrf_is_valid():
+                return render_template_string(HTML_LOGIN, error="Nieprawidlowe zadanie"), 400
             username = request.form['username']
             password = request.form['password']
+
+            if is_login_blocked(username):
+                return render_template_string(HTML_LOGIN, error="Za duzo blednych prob. Sprobuj pozniej.")
+
             if username in USERS and USERS[username] == password:
                 if send_otp_mail(username):
                     session['pending_user'] = username
@@ -136,6 +160,8 @@ def setup_routes(app, cameras):
                 else:
                     return render_template_string(HTML_LOGIN, error="Blad systemu mailowego")
             else:
+                if username in USERS:
+                    record_failed_login(username)
                 return render_template_string(HTML_LOGIN, error="Bledny login lub haslo")
         return render_template_string(HTML_LOGIN)
 
@@ -145,20 +171,26 @@ def setup_routes(app, cameras):
             return redirect(url_for('login'))
         username = session['pending_user']
         if request.method == 'POST':
+            if not csrf_is_valid():
+                return render_template_string(HTML_VERIFY, error="Nieprawidlowe zadanie"), 400
             entered_code = request.form['code']
-            if username in verification_codes and verification_codes[username] == entered_code:
+            if is_otp_blocked(username):
+                session.pop('pending_user', None)
+                return render_template_string(HTML_LOGIN, error="Za duzo blednych kodow. Zaloguj sie ponownie.")
+            if otp_is_valid(username, entered_code):
                 login_user(User(username))
                 session.pop('pending_user', None)
-                if username in verification_codes:
-                    del verification_codes[username]
+                clear_login_state(username)
                 return redirect(url_for('index'))
             else:
-                return render_template_string(HTML_VERIFY, error="Nieprawidlowy kod")
+                return render_template_string(HTML_VERIFY, error="Nieprawidlowy lub wygasly kod")
         return render_template_string(HTML_VERIFY)
 
-    @app.route('/logout')
+    @app.route('/logout', methods=['POST'])
     @login_required
     def logout():
+        if not csrf_is_valid():
+            return "Nieprawidlowe zadanie", 400
         logout_user()
         return redirect(url_for('login'))
 
@@ -192,7 +224,19 @@ def setup_routes(app, cameras):
     @app.route('/video_feed/<cam_name>')
     @login_required
     def video_feed(cam_name):
-        return Response(gen_frames(cam_name), mimetype='multipart/x-mixed-replace; boundary=frame')
+        cam = next((c for c in cameras if c.name == cam_name), None)
+        if cam is None:
+            return "Camera not found", 404
+
+        response = Response(
+            gen_frames(cam_name),
+            mimetype='multipart/x-mixed-replace; boundary=frame'
+        )
+        response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate, max-age=0'
+        response.headers['Pragma'] = 'no-cache'
+        response.headers['Expires'] = '0'
+        response.headers['X-Accel-Buffering'] = 'no'
+        return response
 
     @app.route('/auth')
     def auth():

@@ -29,28 +29,54 @@ def cleanup_old_recordings():
 class CameraStream:
     def __init__(self, config):
         self.name = config["name"]
-        self.url = config["rtsp_url"]
+        self.url = config.get("rtsp_url", "")
+        self.recording_url = config.get("recording_rtsp_url") or self.url
         self.root_dir = ROOT_SAVE_DIR
         self.frame = None
         self.recording = False
         self.buffer = deque(maxlen=BUFFER_SECONDS * FPS)
+        self.recording_buffer = deque(maxlen=BUFFER_SECONDS * FPS)
         self.writer = None
         self.video_file_path = None
         self.frames_left = 0
+        self.motion_active = False
+        self.trailing_frames_left = 0
+        self.last_motion_time = None
+        from config import VAR_THRESHOLD
         self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(
-            history=500, varThreshold=120, detectShadows=False
+            history=500, varThreshold=VAR_THRESHOLD, detectShadows=False
         )
         self.frame_counter = 0
-        self.cap = cv2.VideoCapture(self.url)
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.cap = None
+        if self.url:
+            try:
+                self.cap = cv2.VideoCapture(self.url)
+                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                self.cap = None
+        self.recording_cap = None
         self.thread = threading.Thread(target=self.update, daemon=True)
         self.thread.start()
 
+    def _ensure_recording_cap(self):
+        if not self.recording_url:
+            return None
+        if self.recording_cap is None or not self.recording_cap.isOpened():
+            self.recording_cap = cv2.VideoCapture(self.recording_url)
+            self.recording_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        return self.recording_cap
+
     def update(self):
         while True:
+            if self.cap is None:
+                time.sleep(5)
+                continue
             if not self.cap.isOpened():
                 time.sleep(5)
-                self.cap.open(self.url)
+                try:
+                    self.cap.open(self.url)
+                except Exception:
+                    pass
                 continue
             ret, frame = self.cap.read()
             if not ret:
@@ -60,30 +86,56 @@ class CameraStream:
             frame_resized = cv2.resize(frame, (WIDTH, HEIGHT))
             self.frame = frame_resized.copy()
             self.frame_counter += 1
+
+            # Read recording stream each loop so recording_buffer always has pre-roll frames
+            recording_cap = self._ensure_recording_cap()
+            if recording_cap is not None and recording_cap.isOpened():
+                try:
+                    rec_ret, rec_frame = recording_cap.read()
+                except Exception:
+                    rec_ret = False
+                    rec_frame = None
+                if rec_ret and rec_frame is not None:
+                    rec_frame_resized = cv2.resize(rec_frame, (WIDTH, HEIGHT))
+                    self.recording_buffer.append(rec_frame_resized)
+                    if self.recording and self.writer:
+                        self.writer.write(rec_frame_resized)
+                else:
+                    recording_cap.release()
+                    self.recording_cap = None
+
+            # Only run detection logic on a subset of frames to save CPU
             if self.frame_counter % 3 != 0:
-                if self.recording and self.writer:
-                    self.writer.write(frame_resized)
                 self.buffer.append(frame_resized)
                 continue
             self.process_logic(frame_resized)
 
     def process_logic(self, frame):
         self.buffer.append(frame)
-        if self.detect_motion(frame):
-            self.frames_left = RECORD_AFTER_MOTION * FPS
+        motion_detected = self.detect_motion(frame)
+
+        now = time.time()
+        if motion_detected:
+            self.last_motion_time = now
             if not self.recording:
                 self.start_recording()
+            return
+
+        # no motion detected
         if self.recording:
-            if self.writer:
-                self.writer.write(frame)
-            self.frames_left -= 3
-            if self.frames_left <= 0:
+            if self.last_motion_time is None:
+                # safety: stop if we have no record of motion
+                self.stop_recording()
+                return
+            # stop after RECORD_AFTER_MOTION seconds since last motion
+            if now - self.last_motion_time >= RECORD_AFTER_MOTION:
                 self.stop_recording()
 
     def detect_motion(self, frame):
         blurred = cv2.GaussianBlur(frame, (21, 21), 0)
         fg_mask = self.bg_subtractor.apply(blurred)
-        _, thresh = cv2.threshold(fg_mask, 244, 255, cv2.THRESH_BINARY)
+        from config import THRESHOLD_VALUE, MIN_AREA
+        _, thresh = cv2.threshold(fg_mask, THRESHOLD_VALUE, 255, cv2.THRESH_BINARY)
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for contour in contours:
             if cv2.contourArea(contour) > MIN_AREA:
@@ -97,9 +149,23 @@ class CameraStream:
         os.makedirs(path, exist_ok=True)
         ts = now.strftime("%H-%M-%S")
         filename = os.path.join(path, f"motion_{ts}.webm")
-        self.video_file_path = filename
-        self.writer = cv2.VideoWriter(filename, cv2.VideoWriter_fourcc(*'VP80'), FPS, (WIDTH, HEIGHT))
-        for f in self.buffer:
+        writer_candidates = [
+            (filename, cv2.VideoWriter_fourcc(*'VP80')),
+            (os.path.join(path, f"motion_{ts}.mp4"), cv2.VideoWriter_fourcc(*'mp4v')),
+            (os.path.join(path, f"motion_{ts}.avi"), cv2.VideoWriter_fourcc(*'MJPG')),
+        ]
+        self.writer = None
+        self.video_file_path = None
+        for candidate_path, fourcc in writer_candidates:
+            writer = cv2.VideoWriter(candidate_path, fourcc, FPS, (WIDTH, HEIGHT))
+            if writer.isOpened():
+                self.writer = writer
+                self.video_file_path = candidate_path
+                break
+        if self.writer is None:
+            self.recording = False
+            return
+        for f in self.recording_buffer:
             self.writer.write(f)
 
     def stop_recording(self):
@@ -107,16 +173,19 @@ class CameraStream:
         if self.writer:
             self.writer.release()
             self.writer = None
-            # Usunąć nagrania które trwają dokładnie 15 sekund (kamera się wyłączyła)
-            if self.video_file_path and os.path.exists(self.video_file_path):
-                try:
-                    cap = cv2.VideoCapture(self.video_file_path)
-                    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                    duration_seconds = frame_count / FPS if FPS > 0 else 0
-                    cap.release()
-                    if duration_seconds == 15:
-                        os.remove(self.video_file_path)
-                except Exception:
-                    pass
+        if self.recording_cap is not None and self.recording_cap.isOpened():
+            self.recording_cap.release()
+            self.recording_cap = None
+        self.recording_buffer.clear()
 
-cameras = [CameraStream(cfg) for cfg in CAM_CONFIG]
+cameras = []
+
+
+def build_cameras():
+    created = []
+    for cfg in CAM_CONFIG:
+        try:
+            created.append(CameraStream(cfg))
+        except Exception:
+            continue
+    return created

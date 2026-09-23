@@ -26,23 +26,30 @@ def env_int(key, default):
         return default
 
 
+def required_env(key):
+    value = os.environ.get(key)
+    if not value or value in {"changeme", "example_password", "change_this_to_a_secure_random_value", "generate_a_long_random_value"}:
+        raise RuntimeError(f"Brak bezpiecznej wartosci zmiennej {key} w .env")
+    return value
+
+
 USERS = {
-    "filip": os.environ.get("USER_FILIP_PASSWORD", "changeme"),
-    "marlena": os.environ.get("USER_MARLENA_PASSWORD", "changeme"),
-    "grzegorz": os.environ.get("USER_GRZEGORZ_PASSWORD", "changeme")
+    "filip": required_env("USER_FILIP_PASSWORD"),
+    "marlena": required_env("USER_MARLENA_PASSWORD"),
+    "grzegorz": required_env("USER_GRZEGORZ_PASSWORD")
 }
 
 USER_EMAILS = {
-    "filip": os.environ.get("USER_FILIP_EMAIL", "filip@example.com"),
-    "marlena": os.environ.get("USER_MARLENA_EMAIL", "marlena@example.com"),
-    "grzegorz": os.environ.get("USER_GRZEGORZ_EMAIL", "grzegorz@example.com")
+    "filip": required_env("USER_FILIP_EMAIL"),
+    "marlena": required_env("USER_MARLENA_EMAIL"),
+    "grzegorz": required_env("USER_GRZEGORZ_EMAIL")
 }
 
 MAIL_SETTINGS = {
     "server": os.environ.get("MAIL_SERVER", "smtp.gmail.com"),
     "port": env_int("MAIL_PORT", 587),
-    "user": os.environ.get("MAIL_USER", "user@example.com"),
-    "password": os.environ.get("MAIL_PASSWORD", "changeme")
+    "user": required_env("MAIL_USER"),
+    "password": required_env("MAIL_PASSWORD")
 }
 
 NGINX_URL = os.environ.get("NGINX_URL", "/files/")
@@ -52,19 +59,23 @@ WIDTH, HEIGHT = 1280, 720
 FPS = 15
 BUFFER_SECONDS = 5
 RECORD_AFTER_MOTION = 10
-MIN_AREA = 5000
+MIN_AREA = env_int("MOTION_MIN_AREA", 2000)
+VAR_THRESHOLD = env_int("MOTION_VAR_THRESHOLD", 80)
+THRESHOLD_VALUE = env_int("MOTION_THRESHOLD_VALUE", 200)
 KEEP_DAYS = 30
 
 CAM_CONFIG = [
     {
         "name": os.environ.get("CAM1_NAME", "Furtka"),
-        "rtsp_url": os.environ.get("CAM1_RTSP_URL", "")
+        "rtsp_url": os.environ.get("CAM1_RTSP_URL", ""),
+        "recording_rtsp_url": os.environ.get("CAM1_RECORDING_RTSP_URL", os.environ.get("CAM1_RTSP_URL", ""))
     },
     {
         "name": os.environ.get("CAM2_NAME", "Brama"),
-        "rtsp_url": os.environ.get("CAM2_RTSP_URL", "")
+        "rtsp_url": os.environ.get("CAM2_RTSP_URL", ""),
+        "recording_rtsp_url": os.environ.get("CAM2_RECORDING_RTSP_URL", os.environ.get("CAM2_RTSP_URL", ""))
     }
 ]
 
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
-os.umask(0o000)
+os.umask(0o077)

@@ -1,5 +1,4 @@
 import os
-import shutil
 import pwd
 import grp
 import time
@@ -10,34 +9,17 @@ def segreguj_stare_nagrania_loop():
         try:
             uid = pwd.getpwnam(USER_NAME).pw_uid
             gid = grp.getgrnam(USER_NAME).gr_gid
-            
+
             if os.path.exists(ROOT_SAVE_DIR):
-                for camera_folder in os.listdir(ROOT_SAVE_DIR):
-                    full_path = os.path.join(ROOT_SAVE_DIR, camera_folder)
-                    if not os.path.isdir(full_path): continue
-
-                    for nazwa_pliku in os.listdir(full_path):
-                        if nazwa_pliku.startswith("motion_") and nazwa_pliku.endswith((".mp4", ".webm")):
-                            parts = nazwa_pliku.split("_")
-                            if len(parts) < 3: continue
-
-                            data = parts[1]
-                            godzina = parts[2][:2]
-
-                            folder_dzien = os.path.join(full_path, data)
-                            folder_godzina = os.path.join(folder_dzien, godzina)
-                            
-                            os.makedirs(folder_godzina, exist_ok=True)
-                            os.chown(folder_dzien, uid, gid)
-                            os.chown(folder_godzina, uid, gid)
-
-                            src = os.path.join(full_path, nazwa_pliku)
-                            dst = os.path.join(folder_godzina, nazwa_pliku)
-                            try:
-                                shutil.move(src, dst)
-                                os.chown(dst, uid, gid)
-                            except Exception:
-                                pass
+                for current_root, directory_names, file_names in os.walk(ROOT_SAVE_DIR):
+                    paths = [current_root]
+                    paths.extend(os.path.join(current_root, name) for name in directory_names)
+                    paths.extend(os.path.join(current_root, name) for name in file_names)
+                    for path in paths:
+                        try:
+                            os.chown(path, uid, gid)
+                        except FileNotFoundError:
+                            pass
         except Exception:
             pass
         time.sleep(5)
