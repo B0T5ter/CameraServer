@@ -26,6 +26,24 @@ def env_int(key, default):
         return default
 
 
+def env_float(key, default):
+    try:
+        return float(os.environ.get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def env_bool(key, default):
+    return os.environ.get(key, str(default)).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def env_list(key, default):
+    value = os.environ.get(key)
+    if not value:
+        return default
+    return tuple(item.strip() for item in value.split(",") if item.strip())
+
+
 def required_env(key):
     value = os.environ.get(key)
     if not value or value in {"changeme", "example_password", "change_this_to_a_secure_random_value", "generate_a_long_random_value"}:
@@ -63,6 +81,20 @@ MIN_AREA = env_int("MOTION_MIN_AREA", 2000)
 VAR_THRESHOLD = env_int("MOTION_VAR_THRESHOLD", 80)
 THRESHOLD_VALUE = env_int("MOTION_THRESHOLD_VALUE", 200)
 KEEP_DAYS = 30
+MIN_FREE_DISK_PERCENT = env_float("MIN_FREE_DISK_PERCENT", 10.0)
+TARGET_FREE_DISK_PERCENT = env_float("TARGET_FREE_DISK_PERCENT", 15.0)
+CLEANUP_INTERVAL_HOURS = env_float("CLEANUP_INTERVAL_HOURS", 1.0)
+MIN_RECORDING_AGE_SECONDS = env_int("MIN_RECORDING_AGE_SECONDS", 120)
+OBJECT_DETECTION_ENABLED = env_bool("OBJECT_DETECTION_ENABLED", True)
+OBJECT_MODEL = os.environ.get("OBJECT_MODEL", "yolo11n.pt")
+OBJECT_CONFIDENCE = env_float("OBJECT_CONFIDENCE", 0.35)
+OBJECT_DETECTION_INTERVAL = env_int("OBJECT_DETECTION_INTERVAL", 1)
+OBJECT_CONFIRMATION_FRAMES = env_int("OBJECT_CONFIRMATION_FRAMES", 2)
+MOTION_FALLBACK_ENABLED = env_bool("MOTION_FALLBACK_ENABLED", True)
+DETECTION_CLASSES = env_list(
+    "DETECTION_CLASSES",
+    ("person", "cat", "dog", "car", "motorcycle", "bus", "truck"),
+)
 
 CAM_CONFIG = [
     {

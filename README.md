@@ -8,6 +8,7 @@ A simple camera monitoring system built with Flask, OpenCV, and RTSP. The applic
 - email-based 2FA using a one-time code
 - RTSP live camera streaming
 - motion detection and automatic recording to WEBM
+- object detection for people, animals, and vehicles
 - recordings organized by date and hour
 - automatic cleanup of old recordings after `KEEP_DAYS`
 
@@ -38,6 +39,17 @@ cp .env.example .env
    - `USER_*` — user passwords and email addresses
    - `CAM*_RTSP_URL` — RTSP URLs for cameras
    - `NGINX_URL`, `ROOT_SAVE_DIR`, `USER_NAME` — environment-specific settings
+   - `DETECTION_CLASSES` — comma-separated classes that trigger recording
+   - `OBJECT_MODEL`, `OBJECT_CONFIDENCE`, `OBJECT_CONFIRMATION_FRAMES` — object detector settings
+
+The default detector uses the small `yolo11n.pt` model. Ultralytics downloads the
+model outside this repository on first use. If the model cannot be loaded, the
+application falls back to motion detection when `MOTION_FALLBACK_ENABLED=true`.
+
+Recordings are removed after `KEEP_DAYS` and, when free space drops below
+`MIN_FREE_DISK_PERCENT`, the oldest closed files are removed until
+`TARGET_FREE_DISK_PERCENT` is reached. Files modified in the last
+`MIN_RECORDING_AGE_SECONDS` seconds and currently active recordings are protected.
 
 ## Running the Application
 
@@ -51,7 +63,7 @@ source venv/bin/activate
 2. Install dependencies:
 
 ```bash
-pip install flask flask-login opencv-python
+pip install -r requirements.txt
 ```
 
 3. Start the app:

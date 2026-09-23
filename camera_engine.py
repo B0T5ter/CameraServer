@@ -5,26 +5,81 @@ import threading
 from collections import deque
 from datetime import datetime
 import shutil
-from config import ROOT_SAVE_DIR, WIDTH, HEIGHT, FPS, BUFFER_SECONDS, RECORD_AFTER_MOTION, MIN_AREA, KEEP_DAYS, CAM_CONFIG
+from config import (
+    ROOT_SAVE_DIR, WIDTH, HEIGHT, FPS, BUFFER_SECONDS, RECORD_AFTER_MOTION,
+    MIN_AREA, KEEP_DAYS, CAM_CONFIG, MIN_FREE_DISK_PERCENT,
+    TARGET_FREE_DISK_PERCENT, CLEANUP_INTERVAL_HOURS, MIN_RECORDING_AGE_SECONDS,
+    OBJECT_DETECTION_ENABLED, OBJECT_MODEL,
+    OBJECT_CONFIDENCE, OBJECT_DETECTION_INTERVAL, OBJECT_CONFIRMATION_FRAMES,
+    MOTION_FALLBACK_ENABLED, DETECTION_CLASSES,
+)
+
+ACTIVE_RECORDINGS = set()
+ACTIVE_RECORDINGS_LOCK = threading.Lock()
+VIDEO_SUFFIXES = (".webm", ".mp4", ".avi", ".mkv", ".mov")
+
+
+def cleanup_recordings_once():
+    if not os.path.isdir(ROOT_SAVE_DIR):
+        return 0
+
+    now = time.time()
+    candidates = []
+    deleted_count = 0
+    with ACTIVE_RECORDINGS_LOCK:
+        active_paths = set(ACTIVE_RECORDINGS)
+
+    for current_root, _, file_names in os.walk(ROOT_SAVE_DIR):
+        for file_name in file_names:
+            path = os.path.join(current_root, file_name)
+            if not file_name.lower().endswith(VIDEO_SUFFIXES) or path in active_paths:
+                continue
+            try:
+                stat = os.stat(path)
+            except FileNotFoundError:
+                continue
+            if now - stat.st_mtime < MIN_RECORDING_AGE_SECONDS:
+                continue
+            candidates.append((stat.st_mtime, path))
+
+    candidates.sort()
+    for _, path in candidates:
+        try:
+            relative_path = os.path.relpath(path, ROOT_SAVE_DIR)
+            date_part = relative_path.split(os.sep, 1)[0]
+            try:
+                is_expired = (datetime.now() - datetime.strptime(date_part, "%Y-%m-%d")).days > KEEP_DAYS
+            except ValueError:
+                is_expired = False
+            usage = shutil.disk_usage(ROOT_SAVE_DIR)
+            free_percent = usage.free / usage.total * 100 if usage.total else 100
+            if not is_expired and free_percent >= MIN_FREE_DISK_PERCENT:
+                continue
+            os.remove(path)
+            deleted_count += 1
+            usage = shutil.disk_usage(ROOT_SAVE_DIR)
+            free_percent = usage.free / usage.total * 100 if usage.total else 100
+            if free_percent >= TARGET_FREE_DISK_PERCENT and not is_expired:
+                break
+        except (FileNotFoundError, OSError):
+            continue
+
+    for current_root, directory_names, _ in os.walk(ROOT_SAVE_DIR, topdown=False):
+        for directory_name in directory_names:
+            try:
+                os.rmdir(os.path.join(current_root, directory_name))
+            except OSError:
+                pass
+    return deleted_count
+
 
 def cleanup_old_recordings():
     while True:
         try:
-            now = datetime.now()
-            if os.path.exists(ROOT_SAVE_DIR):
-                for folder_name in os.listdir(ROOT_SAVE_DIR):
-                    folder_path = os.path.join(ROOT_SAVE_DIR, folder_name)
-                    if os.path.isdir(folder_path):
-                        try:
-                            folder_date = datetime.strptime(folder_name, "%Y-%m-%d")
-                            days_old = (now - folder_date).days
-                            if days_old > KEEP_DAYS:
-                                shutil.rmtree(folder_path)
-                        except ValueError:
-                            pass
+            cleanup_recordings_once()
         except Exception:
             pass
-        time.sleep(12 * 3600)
+        time.sleep(max(60, CLEANUP_INTERVAL_HOURS * 3600))
 
 class CameraStream:
     def __init__(self, config):
@@ -55,8 +110,54 @@ class CameraStream:
             except Exception:
                 self.cap = None
         self.recording_cap = None
+        self.object_detector = None
+        self.object_detector_failed = False
+        self.object_detection_counter = 0
+        self.object_detection_hits = 0
         self.thread = threading.Thread(target=self.update, daemon=True)
         self.thread.start()
+
+    def _ensure_object_detector(self):
+        if not OBJECT_DETECTION_ENABLED or self.object_detector_failed:
+            return None
+        if self.object_detector is None:
+            try:
+                from ultralytics import YOLO
+                self.object_detector = YOLO(OBJECT_MODEL)
+            except Exception:
+                self.object_detector_failed = True
+        return self.object_detector
+
+    def detect_objects(self, frame):
+        detector = self._ensure_object_detector()
+        if detector is None:
+            return False
+        self.object_detection_counter += 1
+        if self.object_detection_counter % max(1, OBJECT_DETECTION_INTERVAL) != 0:
+            return self.object_detection_hits >= OBJECT_CONFIRMATION_FRAMES
+        try:
+            results = detector.predict(
+                frame,
+                conf=OBJECT_CONFIDENCE,
+                classes=None,
+                verbose=False,
+                imgsz=640,
+            )
+            detected = set()
+            for result in results:
+                names = result.names
+                for class_id in result.boxes.cls.tolist():
+                    label = names[int(class_id)]
+                    if label in DETECTION_CLASSES:
+                        detected.add(label)
+            if detected:
+                self.object_detection_hits += 1
+            else:
+                self.object_detection_hits = 0
+            return self.object_detection_hits >= max(1, OBJECT_CONFIRMATION_FRAMES)
+        except Exception:
+            self.object_detector_failed = True
+            return False
 
     def _ensure_recording_cap(self):
         if not self.recording_url:
@@ -112,7 +213,11 @@ class CameraStream:
 
     def process_logic(self, frame):
         self.buffer.append(frame)
-        motion_detected = self.detect_motion(frame)
+        object_detected = self.detect_objects(frame)
+        if self.object_detector is not None and not self.object_detector_failed:
+            motion_detected = object_detected
+        else:
+            motion_detected = MOTION_FALLBACK_ENABLED and self.detect_motion(frame)
 
         now = time.time()
         if motion_detected:
@@ -161,6 +266,8 @@ class CameraStream:
             if writer.isOpened():
                 self.writer = writer
                 self.video_file_path = candidate_path
+                with ACTIVE_RECORDINGS_LOCK:
+                    ACTIVE_RECORDINGS.add(candidate_path)
                 break
         if self.writer is None:
             self.recording = False
@@ -173,6 +280,9 @@ class CameraStream:
         if self.writer:
             self.writer.release()
             self.writer = None
+        if self.video_file_path:
+            with ACTIVE_RECORDINGS_LOCK:
+                ACTIVE_RECORDINGS.discard(self.video_file_path)
         if self.recording_cap is not None and self.recording_cap.isOpened():
             self.recording_cap.release()
             self.recording_cap = None
